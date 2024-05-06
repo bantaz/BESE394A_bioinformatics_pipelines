@@ -1,0 +1,415 @@
+---
+title: "GSE198256_Analysis_pipline"
+author: "Azari Bantan"
+date: "2024-February"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Experimental design
+
+The data is available at Gene Expression Omnibus (GEO) with the following accession ID: 'GSE198256'. 
+Here, we read the count matrix (called 'GSE198256_count') and its sample information including the 'Group' which refers to the status of patient's sample to either of the following: 
+
+* Healthy 
+* Covid19: Acute infection (Re-named: Covid19AI)
+* Covid19: Recovery 3Mo (Re-named: Covid193Mo)
+* Covid19: Recovery 6Mo (Re-named: Covid196Mo)
+
+
+
+```{r read data}
+
+# Read data
+urld <- "https://www.ncbi.nlm.nih.gov/geo/download/?format=file&type=rnaseq_counts"
+path <- paste(urld, "acc=GSE198256", "file=GSE198256_raw_counts_GRCh38.p13_NCBI.tsv.gz", sep="&");
+GSE198256_count <- as.matrix(data.table::fread(path, header=T, colClasses="integer"), rownames=1)
+
+# Read Meta data
+library(GEOquery)
+gds <- getGEO("GSE198256")
+Meta_GSE198256 <- pData(gds$GSE198256_series_matrix.txt.gz@phenoData)
+Group <- Meta_GSE198256[,c("disease state:ch1")]
+
+# renaming meta data
+rownames(Meta_GSE198256)==colnames(GSE198256_count)
+Group[Group=="Covid19: Acute infection"] <- "Covid19AI"
+Group[Group=="Covid19: Recovery 3Mo"] <- "Covid193Mo"
+Group[Group=="Covid19: Recovery 6Mo"] <- "Covid196Mo"
+
+# factor
+factor_GSE198256 <- data.frame(Group)
+rownames(factor_GSE198256) <- rownames(Meta_GSE198256)
+factor_GSE198256
+
+```
+
+## Exploring the count data 
+
+The library size in RNA-seq refers to the total number of reads or fragments that were sequenced for a particular sample. Here, we can visualize the library sizes across all samples
+
+
+```{r explore count data}
+
+dim(GSE198256_count)
+total_reads <- sum(GSE198256_count)
+total_reads
+
+library(ggplot2)
+library_size <- colSums(GSE198256_count)
+log_library_sizes <- log2(library_size + 1)  # Adding 1 to avoid log(0)
+barplot(log_library_sizes,
+        xlab="Samples", 
+        ylab="Log(unormalized_counts)")
+
+```
+
+Various technical factors, such as transcript length, GC content, PCR artifacts, uneven coverage of transcript reads, off-target transcript contamination, and significant variations in transcript distributions, can disrupt the linear relationship between transcript abundance and the count of mapped reads at a gene locus. This can be explored using DESeq Bioconductor package using the biological metadata of the mapped genes exported from Ensembl BioMart: https://www.ensembl.org.  
+
+``` {r explore count data by NOISeq}
+library(NOISeq)
+
+# Reading the biological meta data of the mapped gene which was retrieved from Ensembl BioMart
+annotgene <- read.csv("GSE198256_mart_export.txt",sep="\t",header = T)
+annotgene <- annotgene[annotgene$Chromosome %in% c(as.character(1:22) ,"X","Y"),] # Filter the information
+annotgene_filt <- annotgene[!duplicated(annotgene$Entrezgene),] # Filter duplicates 
+
+## Overlap between annotation and genes
+rownames(annotgene_filt) <- as.character(annotgene_filt$Entrezgene)
+sum(as.character(rownames(annotgene_filt)) %in% rownames(GSE198256_count))
+ 
+##  Work with the annotated genes!
+GSE198256_count <- GSE198256_count[rownames(GSE198256_count) %in% rownames(annotgene_filt),]
+annotgene_ord <- annotgene_filt[rownames(GSE198256_count),]
+              
+
+# Cerating a NOISeq object for exploration 
+lengthuse <- abs(annotgene_ord$end-annotgene_ord$start)
+names(lengthuse) <- rownames(annotgene_ord)
+gc <- annotgene_ord$GC
+names(gc) <- rownames(annotgene_ord)
+biotype <-annotgene_ord$type
+names(biotype) <- rownames(annotgene_ord)
+chromosome <- annotgene_ord[,c("Chromosome","start","end")]
+data_NOISEQ <- readData(data = GSE198256_count,
+                        length=lengthuse,
+                        gc=gc,
+                        biotype= biotype ,
+                        chromosome = annotgene_ord[,c("Chromosome","start","end")],
+                        factors = factor_GSE198256)
+
+data_NOISEQ
+
+
+# Generating a QC report 
+QCreport(data_NOISEQ, samples = NULL, factor = "Group", norm = FALSE)
+
+```
+
+
+## DESeq2: Creating a DESeq object and set design 
+
+The first step before normalization using the DESeq2 package, we need to create a DESeq2 object for storing the read counts. We can use this object to explore the raw counts and apply filtering before normalization. In this DESeq2 object, we can also add information about the design model (a design formula to be used for downstream analysis i.e., estimate the dispersions, lof2 fold changes for differential expression ...etc.). Here, we we will use the 'Group' meta data to create our model design (~ Group)
+
+
+```{r creating DESeq object}
+
+# creating a DESeq2 object 
+library(DESeq2)
+GSE198256_DESeq2 <- DESeqDataSetFromMatrix(countData = GSE198256_count,
+                                           colData = factor_GSE198256,
+                                           design = ~ Group)
+
+```
+
+## Pre-filtering
+
+Filtering low count genes can improve the sensitivity of detecting differentially expressed genes, also it would reduce the memory size of the dds data object (see dds later) and increase the speed of modelling processing 
+
+```{r filtering low count genes }
+
+# Filtering low count genes 
+
+smallestGroupSize <- 2
+keep <- rowSums(counts(GSE198256_DESeq2) >= 10) >= smallestGroupSize
+table(keep)
+GSE198256_DESeq2_f <- GSE198256_DESeq2[keep,]
+
+```
+
+## DESeq2: Normalize 
+
+```{r Normalization}
+
+# Normalization
+GSE198256_dds <- DESeq(GSE198256_DESeq2_f)
+
+# Inspection of Normalized data 
+
+logcounts <- log(assay(GSE198256_dds) + 1)
+boxplot(logcounts, 
+        xlab="", 
+        ylab="Log(normalized_counts)",
+        las=2)
+
+```
+
+## Principal Component Analysis (PCA) 
+
+Exploring data by Principal Component Analysis (PCA) enables the visualization of the complex datasets in a lower-dimensional space. By plotting the data based on the first two principal components, capture the major sources of variability (40% and 16% respectively), we can identify grouping of samples. Both Covid193Mo and Healthy seem to have similar patterns and are clustered together, along with Covid196Mo to some extent. Whereas Covid19AI, seems to distinctly group together from other groups of samples. 
+
+```{r Explore by PCA }
+
+# PCA 
+vsd <- vst(GSE198256_dds,blind=TRUE)
+plotPCA(vsd,intgroup=c("Group"))
+
+```
+
+## DESeq2 Differential Expression Analysis (DEA)
+
+To comprehend the variations in statistical inference across distinct 'Groups' of samples, the identification of differentially expressed genes is employed. The DESeq2 package facilitates this process by utilizing negative binomial generalized linear models for testing differential expression. The results are stored in 'GSE198256_dds'
+
+
+*Disoersion plot*
+The plotDispEsts() function in the DESeq2 package is used to create a dispersion diagnostic plot. We can observe the overall trend of how dispersion changes with the mean expression level, and since the trend line is relatively flat, it suggests that dispersion is consistent and the chosen statistical model adequately captures the variability in the data.
+
+
+*Shrinkage of LFC estimates*
+lfcShrink() function from the DESeq2 package, is used for shrinkage estimation of log2 fold changes (LFCs), which helps to stabilize the LFC estimates, especially when dealing with genes with low counts or high levels of variability. Here, we use 'apeglm' method from the apeglm package (Zhu, Ibrahim, and Love 2018). 
+
+
+
+```{r DEA}
+
+# recall: GSE198256_dds <- DESeq(GSE198256_DESeq2_f
+GSE198256_dds
+res <- results(GSE198256_dds) # here, the comparison made is Healthy vs Covid193Mo 
+resultsNames(GSE198256_dds)
+
+# We can also get the results specifying contrast of interest 
+res_Covid19AIvsHealthy <- results(GSE198256_dds, contrast = c("Group", "Covid19AI", "Healthy")) # here, the comparison made is Healthy vs Covid193Mo 
+
+# Dispersion plot 
+plotDispEsts(GSE198256_dds, main="Dispersion plot")
+
+
+# LFC Shrinkage (Example using results of Group_Covid19AI_vs_Covid193Mo)
+resultsNames(GSE198256_dds)
+resLFC_AIvsEarly <- lfcShrink(GSE198256_dds, coef="Group_Covid19AI_vs_Covid193Mo", type="apeglm")
+resLFC_AIvsEarly
+
+# comparing results before and after applying lfcShrink()
+plotMA(res, ylim=c(-2,2)) + plotMA(resLFC_AIvsEarly, ylim=c(-2,2))
+
+
+# Generating resLFC for different comparisons of interest and store 
+resLFC_AIvsEarly <- lfcShrink(GSE198256_dds, coef="Group_Covid19AI_vs_Covid193Mo", type="apeglm")  # Covid193Mo = Early 
+resLFC_HealthyvsEarly <- lfcShrink(GSE198256_dds, coef="Group_Healthy_vs_Covid193Mo", type="apeglm") # Covid193Mo = Early 
+resLFC_LatevsEarly <- lfcShrink(GSE198256_dds, coef="Group_Covid196Mo_vs_Covid193Mo", type="apeglm") # Covid193Mo = Early; # Covid196Mo = Late 
+
+
+```
+
+## Visualization of differentially expressed (DE) genes:
+
+This Volcano plot is generated using EnhancedVolcano (Blighe, Rana, and Lewis 2018). The volcano plot helps to visualize DEGs when comparing two groups. Each dot represents a gene, and are color-coded based on threshold cuts of p-value and/or LogFC.  
+
+``` {r Visualizing DEGs}
+
+# mapping ENTREZID to SYMBOL
+library("AnnotationDbi")
+library("org.Hs.eg.db")
+resLFC_AIvsEarly$symbol <- mapIds(org.Hs.eg.db, keys = rownames(resLFC_AIvsEarly), keytype = "ENTREZID", column = "SYMBOL")
+
+
+# plotting 
+library(EnhancedVolcano)
+  EnhancedVolcano(resLFC_AIvsEarly,
+    lab = resLFC_AIvsEarly$symbol,
+    x = 'log2FoldChange',
+    y = 'pvalue', 
+    title = 'Volcano Plot for DEGs: Covid19AI vs Covid193Mo',
+    pCutoff = 1e-05,
+    FCcutoff = 1)
+  
+  
+# To visualize all results of different contrasts: 
+  
+VP_resLFC_AIvsEarly <- EnhancedVolcano(resLFC_AIvsEarly,
+                                       lab = resLFC_AIvsEarly$symbol,
+                                       x = 'log2FoldChange',
+                                       y = 'pvalue', 
+                                       title = 'Volcano Plot for DEGs: Covid19AI vs Covid193Mo',
+                                       pCutoff = 1e-05,
+                                       FCcutoff = 1)
+VP_resLFC_AIvsEarly
+ 
+
+resLFC_HealthyvsEarly$symbol <- mapIds(org.Hs.eg.db, keys = rownames(resLFC_HealthyvsEarly), keytype = "ENTREZID", column = "SYMBOL")
+VP_resLFC_HealthyvsEarly <- EnhancedVolcano(resLFC_HealthyvsEarly,
+                                            lab = resLFC_HealthyvsEarly$symbol,
+                                            x = 'log2FoldChange',
+                                            y = 'pvalue', 
+                                            title = 'Volcano Plot for DEGs: Healthy vs Covid193Mo',
+                                            pCutoff = 1e-05,
+                                            FCcutoff = 1)
+VP_resLFC_HealthyvsEarly
+ 
+
+resLFC_LatevsEarly$symbol <- mapIds(org.Hs.eg.db, keys = rownames(resLFC_LatevsEarly), keytype = "ENTREZID", column = "SYMBOL")
+VP_resLFC_LatevsEarly <- EnhancedVolcano(resLFC_LatevsEarly,
+                                         lab = resLFC_LatevsEarly$symbol,
+                                         x = 'log2FoldChange',
+                                         y = 'pvalue', 
+                                         title = 'Volcano Plot for DEGs: Covid196Mo vs Covid193Mo',
+                                         pCutoff = 1e-05,
+                                         FCcutoff = 1)
+
+VP_resLFC_LatevsEarly
+```
+
+
+## Identifying top DEGs per contrast 
+
+```{r volcano plot for DEGs}
+
+# DEA results 
+resLFC_AIvsEarly
+resLFC_HealthyvsEarly
+resLFC_LatevsEarly
+
+resSort_LFC_AIvsEarly <- resLFC_AIvsEarly[order(resLFC_AIvsEarly$padj),]
+top100_LFC_AIvsEarly <- resSort_LFC_AIvsEarly[1:100,]
+
+resSort_LFC_HealthyvsEarly<- resLFC_HealthyvsEarly[order(resLFC_HealthyvsEarly$padj),]
+top100_LFC_HealthyvsEarly <- resSort_LFC_HealthyvsEarly[1:100,]
+
+resSort_LFC_LatevsEarly <- resLFC_LatevsEarly[order(resLFC_LatevsEarly$padj),]
+top100_LFC_LatevsEarly <- resSort_LFC_LatevsEarly[1:100,]
+
+
+# Generating heatmap to visualize top results (Example: top100_LFC_AIvsEarly)
+library("pheatmap")
+vsd <- assay(vst(GSE198256_dds))[rownames(top100_LFC_AIvsEarly),]
+rownames(vsd) <- top100_LFC_AIvsEarly$symbol
+Z <- t(scale(t(vsd)))
+p1 <- pheatmap(Z, cluster_rows=T, show_rownames=T,
+         cluster_cols=FALSE, annotation_col=factor_GSE198256, main = "top100: AI vs Early")
+
+
+```
+
+## Identifying top up-/down-regulated genes for Over-representation Analysis (ORA) 
+
+```{r Top significant DEGs (p<0.05)}
+library(clusterProfiler)
+library(msigdbr)
+library(org.Hs.eg.db)
+library(magrittr)
+
+resLFC_AIvsEarly
+
+# Filter results for genes with adjusted p-value (padj) less than 0.05
+resLFC_AIvsEarly_sig <- subset(resLFC_AIvsEarly, padj < 0.05)
+
+# Visualize on heatmap (only showing the two groups)
+factor_sample_names_to_keep <- subset(factor_GSE198256, factor_GSE198256$Group == "Covid19AI" | factor_GSE198256$Group == "Covid193Mo")
+dds_filtered <- GSE198256_dds[, rownames(colData(GSE198256_dds)) %in% rownames(factor_sample_names_to_keep)]
+vsd <- assay(vst(dds_filtered))[rownames(resLFC_AIvsEarly_sig),]
+rownames(vsd) <- resLFC_AIvsEarly_sig$symbol
+Z <- t(scale(t(vsd)))
+pheatmap(Z, cluster_rows=T, show_rownames=T, cluster_cols=FALSE, annotation_col=factor_GSE198256, main = "Signficant DEGs in AI vs Early")
+
+```
+
+
+```{r ORA for top significant DEGs (p<0.05)}
+
+
+# ORA for top significant up-regulated & down-regulated genes 
+
+## determine background 
+count <- assay(GSE198256_dds, normalized = T)
+background_set <- unique(rownames(count))
+
+## determine gene set  
+msigdbr_species()
+hs_msigdb_df <- msigdbr(species = "Homo sapiens")
+head(hs_msigdb_df)
+hs_go_df <- hs_msigdb_df %>%
+  dplyr::filter(
+    gs_subcat == "GO:BP" # This is because we only want KEGG pathways
+  )
+
+## up-regulated (logFC > 1)
+resLFC_AIvsEarly_sig_up <- subset(resLFC_AIvsEarly, log2FoldChange > 1)
+
+go_ora_results_up <- enricher(
+  gene = rownames(resLFC_AIvsEarly_sig_up), # A vector of your genes of interest
+  pvalueCutoff = 0.1, # Can choose a FDR cutoff
+  pAdjustMethod = "BH", # Method to be used for multiple testing correction
+  universe = background_set, # A vector containing your background set genes
+  # The pathway information should be a data frame with a term name or
+  # identifier and the gene identifiers
+  TERM2GENE = dplyr::select(
+    hs_go_df,
+    gs_name,
+    human_entrez_gene
+  )
+)
+
+enrich_plot_upregulated <- enrichplot::dotplot(go_ora_results_up, showCategory = 20)
+enrich_plot_upregulated
+
+
+## down-regulated (logFC < -1)
+resLFC_AIvsEarly_sig_down <- subset(resLFC_AIvsEarly, log2FoldChange < -1)
+
+go_ora_results_down <- enricher(
+  gene = rownames(resLFC_AIvsEarly_sig_down), # A vector of your genes of interest
+  pvalueCutoff = 0.1, # Can choose a FDR cutoff
+  pAdjustMethod = "BH", # Method to be used for multiple testing correction
+  universe = background_set, # A vector containing your background set genes
+  # The pathway information should be a data frame with a term name or
+  # identifier and the gene identifiers
+  TERM2GENE = dplyr::select(
+    hs_go_df,
+    gs_name,
+    human_entrez_gene
+  )
+)
+
+enrich_plot_downregulated <- enrichplot::dotplot(go_ora_results_down, showCategory = 20)
+enrich_plot_downregulated
+
+```
+
+
+## Gene-set Enrichment Analysis (GSEA)
+```{r GSEA}
+
+resLFC_AIvsEarly_genes <- resLFC_AIvsEarly$log2FoldChange
+names(resLFC_AIvsEarly_genes) <- rownames(resLFC_AIvsEarly)
+gene_list<-na.omit(resLFC_AIvsEarly_genes)
+gene_list = sort(gene_list, decreasing = TRUE)
+gse <- gseGO(geneList=gene_list, 
+             ont ="BP", 
+             keyType = "ENTREZID", 
+             minGSSize = 3, 
+             maxGSSize = 200, 
+             pvalueCutoff = 0.05, 
+             verbose = TRUE, 
+             OrgDb = "org.Hs.eg.db", 
+             pAdjustMethod = "BH")
+# dotplot 
+require(DOSE)
+dotplot(gse, showCategory=10, split=".sign") + facet_grid(.~.sign)
+
+
+```
