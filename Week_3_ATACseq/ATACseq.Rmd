@@ -1,0 +1,461 @@
+---
+title: "ATACseq analysis using GSE79019 dataset"
+output: html_document
+date: "2024-02-11"
+---
+
+## Analyzing ATAC-seq from Ramirez et al dataset 
+*96hrs in macrophage, neutrophil and monocyte*
+
+Ramirez et al. (2017) shed light on the complex transcriptional landscape underlying human myeloid differentiation through their comprehensive study, providing valuable insights into the regulatory mechanisms orchestrating the transition of hematopoietic stem cells into mature myeloid lineages.
+
+In this manuscript, we present a pipeline analysis of ATAC-seq data derived from Ramirez et al. (2017). Our focus lies on three cell types: macrophages, monocytes, and neutrophils. These three cell types, each represented by three biological replicates at the 96-hour time point, constitute the foundation of our investigation.
+
+
+Download ATAC-seq data using the following accession ID: GSE79019 (https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE79019)
+
+The following samples are analyzed in this manuscript: 
+- GSM2083775	96h Macrophage Rep 1 ATAC-seq
+- GSM2083776	96h Macrophage Rep 2 ATAC-seq
+- GSM2083777	96h Macrophage Rep 3 ATAC-seq
+- GSM2083799	96h Neutrophil Rep 1 ATAC-seq
+- GSM2083800	96h Neutrophil Rep 2 ATAC-seq
+- GSM2083801	96h Neutrophil Rep 3 ATAC-seq
+- GSM2083823	96h Monocyte Rep 1 ATAC-seq
+- GSM2083824	96h Monocyte Rep 2 ATAC-seq
+- GSM2083825	96h Monocyte Rep 3 ATAC-seq
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r installing packages}
+
+packages <- c(
+  "universalmotif", "MotifDb", 
+  "TFBSTools", "JASPAR2020", "motifmatchr", 
+  "BSgenome.Hsapiens.UCSC.hg38", 
+  "GenomicRanges", "ChIPseeker",
+  "clusterProfiler", "chipenrich",
+  "TxDb.Hsapiens.UCSC.hg38.knownGene",
+  "rtracklayer", "DESeq2")
+
+# avoid installing already present packaged
+packages <- setdiff(packages, rownames(installed.packages()))
+if(length(packages) > 0){
+  BiocManager::install(packages)
+}
+
+```
+
+
+
+## Paths for importing the dataset
+```{r loading dataset}
+bed_files <- file.path(dir("~/Library/Mobile Documents/com~apple~CloudDocs/BESE394/Week_3/dataset", pattern = '*.bed')) # all files with the peaks (reading BED files)
+```
+
+
+## Idenitfy consusnsus peaks 
+
+Download BEDtools in the directory: git clone https://github.com/arq5x/bedtools2.git and after downloading BEDTools, you need to compile it.
+
+A custom function called "perform_intersection" is defined to perform the intersection of peak files within each cell type. It utilizes the 'bedtools intersect' command-line tool to find the common peaks among replicates of each cell type and save them to separate output files. The intersected files for each cell type are then concatenated together using 'cat' command, sorted, and merged to create a union of all peaks across replicates within each cell type. This is achieved using 'bedtools sort'and 'bedtools merge' command-line tools. This will be used as our reference bed file. 
+
+
+```{r BED tools: Identify consensus peaks}
+
+# libraries 
+library("rtracklayer")
+
+# The BED files path 
+file_paths <- c(
+  "GSM2083775_96h-Mac-Rep1.peaks.bed",
+  "GSM2083776_96h-Mac-Rep2.peaks.bed",
+  "GSM2083777_96h-Mac-Rep3.peaks.bed",
+  "GSM2083799_96h-Neu-Rep1.peaks.bed",
+  "GSM2083800_96h-Neu-Rep2.peaks.bed",
+  "GSM2083801_96h-Neu-Rep3.peaks.bed",
+  "GSM2083823_96h-Mon-Rep1.peaks.bed",
+  "GSM2083824_96h-Mon-Rep2.peaks.bed",
+  "GSM2083825_96h-Mon-Rep3.peaks.bed")
+
+
+# Define file paths for each cell type
+mac_files <- file_paths[grep("Mac", file_paths)]
+neu_files <- file_paths[grep("Neu", file_paths)]
+mon_files <- file_paths[grep("Mon", file_paths)]
+
+# Define output file names for intersections and union
+mac_intersect_output <- "mac_intersect.bed"
+neu_intersect_output <- "neu_intersect.bed"
+mon_intersect_output <- "mon_intersect.bed"
+union_output <- "union.bed"
+
+
+# Function to perform intersection of replicates within a cell type
+perform_intersection <- function(files, output_file) {
+  system(paste("bedtools intersect -a", paste(files, collapse = " -b "), "-u >", output_file))
+}
+
+
+# Perform intersection for each cell type
+perform_intersection(mac_files, mac_intersect_output)
+perform_intersection(neu_files, neu_intersect_output)
+perform_intersection(mon_files, mon_intersect_output)
+
+# Perform union of intersected files
+system(paste("cat", mac_intersect_output, neu_intersect_output, mon_intersect_output, "| bedtools sort | bedtools merge >", union_output))
+
+
+#### Inspecting the output files ####
+macrophages_intersect <- import("/Users/bantanai/Library/Mobile Documents/com~apple~CloudDocs/BESE394/Week_3/dataset/macrophages_intersect.bed")
+monocytes_intersect <- import("/Users/bantanai/Library/Mobile Documents/com~apple~CloudDocs/BESE394/Week_3/dataset/monocytes_intersect.bed")
+neutrophils_intersect <- import("/Users/bantanai/Library/Mobile Documents/com~apple~CloudDocs/BESE394/Week_3/dataset/neutrophils_intersect.bed")
+union_bed <- import("/Users/bantanai/Library/Mobile Documents/com~apple~CloudDocs/BESE394/Week_3/dataset/union.bed")
+
+## --- how many peaks?
+paste("There are", length(macrophages_intersect), "peaks intersecting across the replicates of macrophages samples")
+paste("There are", length(monocytes_intersect), "peaks intersecting across the replicates of monocytes samples")
+paste("There are", length(neutrophils_intersect), "peaks intersecting across the replicates of neutrophils samples")
+paste("There are", length(union_bed), "union peaks across the cell types at 96hrs")
+
+```
+
+
+Finally, the resulting intersected and union files are imported using the "import" function from the "rtracklayer" library for further analysis and visualization. The imported files are assigned to variables: "macrophages_intersect," "monocytes_intersect," "neutrophils_intersect," and "union_bed." These files contain the genomic coordinates of the intersected peaks within replicates in each cell type and the union of peaks across all cell types, respectively.
+
+```{r BED tools: Identify consensus peaks}
+
+## --- how many peaks (visualize)?
+# Function to count peaks in each BED file
+library(data.table)
+count_peaks <- function(file) {
+  peaks <- fread(file)
+  return(nrow(peaks))
+}
+ # Count peaks in each BED file
+bed_files <- bed_files[-which(bed_files == "ENCFF356LFX.bed")]
+peak_counts <- sapply(bed_files, count_peaks)
+# Create a bar plot
+barplot(peak_counts, names.arg = c("MacRep1", "MacRep2", "MacRep3", "NeuRep1", "NeuRep2", "NeuRep3", "MonRep1", "MonRep2", "MonRep3", "macInt", "monInt", "neuInt", "union"), ylab = "Number of Peaks", col = "skyblue", main = "Number of Peaks in Each BED File", las = 2)
+
+
+# loading black listed regions
+# https://www.encodeproject.org/annotations/ENCSR636HFF/
+black_listed_bed <- import('/Users/bantanai/Library/Mobile Documents/com~apple~CloudDocs/BESE394/Week_3/dataset/ENCFF356LFX.bed')
+# any hit?
+hits <- findOverlaps(union_bed, black_listed_bed)
+# what about the length of the overlap?
+overlaps <- pintersect(union_bed[queryHits(hits)], 
+                       black_listed_bed[subjectHits(hits)])
+summary(width(overlaps)/width(union_bed[queryHits(hits)]))
+
+# eliminating the blacklisted regions
+union_bed <- union_bed[-queryHits(hits)]
+
+# writing the reference
+export.bed(union_bed, con = 'refererence.bed')
+
+
+```
+
+
+
+## Bigwig + BED files to count-matrix 
+
+The following R script converts BigWig and BED files into a count matrix, summarizing read counts for each genomic region represented by the peaks in the BED file across multiple samples. 
+
+
+```{r Bigwig + BED files to count-matrix}
+
+# control panel
+raw_data_folder <- "~/Library/Mobile Documents/com~apple~CloudDocs/BESE394/Week_3/dataset"
+read_length <- 36
+chromosomes <- paste0('chr', c(1:22, 'X', 'Y'))
+sample_name <- c("MacRep1", "MacRep2", "MacRep3", "NeuRep1", "NeuRep2", "NeuRep3", "MonRep1", "MonRep2", "MonRep3")
+
+# path for importing Bigwig files
+bw_files <- file.path(raw_data_folder, dir(raw_data_folder, pattern = '*.bw'))
+
+# importing reference bed
+peaks <- import("/Users/bantanai/Library/Mobile Documents/com~apple~CloudDocs/BESE394/Week_3/dataset/refererence.bed")
+peaks <- peaks[seqnames(peaks) %in% chromosomes]
+seqlevels(peaks) <- chromosomes
+
+# Initializing Count Matrix:
+count_matrix <- matrix(0, length(peaks), length(bw_files))
+rownames(count_matrix) <- paste0(seqnames(peaks), '_', start(peaks), '_', end(peaks))
+colnames(count_matrix) <- letters[1:length(bw_files)]
+
+# looping over files
+for(i in 1:length(bw_files)){
+  
+  # current files
+  print(paste0('sample ', i, ' out of ', length(bw_files)))
+  bw_file <- bw_files[i]
+  
+  # loadind and downsizing the bigwigfile
+  bw_file_list <- BigWigFileList(bw_file)
+  coverage <- import(bw_file_list[[1]], as = 'RleList')
+  coverage <- coverage[names(coverage) %in% chromosomes]
+  
+  # split the peaks across chromosomes
+  peaks_list <- split(peaks, seqnames(peaks))
+
+  # coverage per peak
+  coverage <- coverage[names(peaks_list)]
+  peaks_coverage <- Views(coverage, ranges(peaks_list))
+
+  # count values
+  counts <- sapply(peaks_coverage, sum)
+  
+  # ensuring to have the right peak information
+  chrs <- rep(names(peaks_coverage), sapply(peaks_coverage, length))
+  starts <- sapply(peaks_coverage, start)
+  ends <- sapply(peaks_coverage, end)
+
+  # converting to vector
+  counts <- unlist(counts)
+  names(counts) <- paste0(chrs, '_', unlist(starts), '_', unlist(ends))
+  
+  # rounding up
+  counts <- round(counts / read_length)
+  
+  # count as data frame
+  count_matrix[names(counts), i] <- counts
+  colnames(count_matrix)[i] <- sample_name[i]
+}
+
+
+# writing
+count_matrix <- as.data.frame(count_matrix)
+head(count_matrix)
+write.csv(count_matrix, row.names = FALSE,
+          file = 'count_matrix.csv')
+
+```
+
+
+## Differentially Accessible Peaks
+
+Here, differential gene expression analysis is conducted using the DESeq2 package. 
+
+Metadata about the samples (cell types) is created in a data frame named "coldata." Each sample is assigned a cell type label ("Mac96h," "Neu96h," or "Mon96h"). A DESeqDataSet object is created from the count matrix and sample metadata. The design formula specifies the model for differential expression analysis, which in this case is comparing the cell types. Contrasts are defined to compare the expression levels between different pairs of cell types ("Mon96h" vs. "Neu96h," "Mon96h" vs. "Mac96h," and "Neu96h" vs. "Mac96h").
+
+```{r differenital testing}
+library(DESeq2)
+
+# Creating Sample Metadata
+coldata <- data.frame(c(rep("Mac96h",3), rep("Neu96h", 3),  rep("Mon96h", 3)))
+colnames(coldata) <- "celltype"
+rownames(coldata) <- colnames(count_matrix)
+coldata$celltype <- factor(coldata$celltype)
+
+# Creating DESeqDataSet: 
+dds <- DESeqDataSetFromMatrix(countData = count_matrix,
+                              colData = coldata,
+                              design = ~ celltype)
+
+# Filtering Low Counts: Rows with low counts are filtered out based on a threshold of at least 10 counts in at least two samples.
+smallestGroupSize <- 2
+keep <- rowSums(counts(dds) >= 10) >= smallestGroupSize
+dds <- dds[keep,]
+
+dds$celltype <- factor(dds$celltype, levels = c("Mac96h","Neu96h", "Mon96h"))
+dds <- DESeq(dds)
+
+# Extracting Differential Expression Results
+dds_res_Mon96hvsNeu96h <- results(dds, contrast = c("celltype", "Mon96h", "Neu96h"))
+dds_res_Mon96hvsMac96h <- results(dds, contrast = c("celltype", "Mon96h", "Mac96h"))
+dds_res_Neu96hvsMac96h <- results(dds, contrast = c("celltype", "Neu96h", "Mac96h"))
+
+
+```
+## Principal Components Analysis
+
+PC1 explains 79% of the variance, indicating that it captures a substantial portion of the variability in the dataset. Plotting the samples in the space defined by the first two principal components reveals the separation of monocytes and neutrophils, distantly away from macrophages.
+
+```{r PCA}
+dds
+rlog <- rlog(dds)
+plotPCA(rlog, intgroup="celltype")
+
+```
+## More into Differentially Analysis
+
+*Visualization* 
+Now, let's visualize the results of differential gene expression analysis using MA plots and volcano plots.
+
+```{r Visualize differential results}
+
+plotMA(dds_res_Mon96hvsNeu96h)
+plotMA(dds_res_Mon96hvsMac96h)
+plotMA(dds_res_Neu96hvsMac96h)
+
+
+
+library(EnhancedVolcano)
+EnhancedVolcano(dds_res_Mon96hvsNeu96h,
+                lab = rownames(dds_res_Mon96hvsNeu96h),
+                x = 'log2FoldChange',
+                y = 'pvalue')
+
+EnhancedVolcano(dds_res_Mon96hvsMac96h,
+                lab = rownames(dds_res_Mon96hvsNeu96h),
+                x = 'log2FoldChange',
+                y = 'pvalue')
+
+
+EnhancedVolcano(dds_res_Neu96hvsMac96h,
+                lab = rownames(dds_res_Mon96hvsNeu96h),
+                x = 'log2FoldChange',
+                y = 'pvalue')
+
+```
+
+*Significant differenital accessible peaks* 
+
+Here, we select significant differential accessible peaks based on adjusted p-values (padj) less than 0.05 for three pairwise comparisons: "Mon96h vs Neu96h," "Mon96h vs Mac96h," and "Neu96h vs Mac96h." Finally, we report the number of common significant differential accessible regions among the different cell types comparisons.
+
+```{r keeping significant differential accessible peaks (padj<0.05)}
+
+nrow(dds_res_Mon96hvsNeu96h)
+table(dds_res_Mon96hvsNeu96h$padj < 0.05)
+dds_res_Mon96hvsNeu96h_sig <- subset(dds_res_Mon96hvsNeu96h, dds_res_Mon96hvsNeu96h$padj <0.05)
+
+nrow(dds_res_Mon96hvsMac96h)
+table(dds_res_Mon96hvsMac96h$padj < 0.05)
+dds_res_Mon96hvsMac96h_sig <- subset(dds_res_Mon96hvsMac96h, dds_res_Mon96hvsMac96h$padj <0.05)
+
+nrow(dds_res_Neu96hvsMac96h)
+table(dds_res_Neu96hvsMac96h$padj < 0.05)
+dds_res_Neu96hvsMac96h_sig <- subset(dds_res_Neu96hvsMac96h, dds_res_Neu96hvsMac96h$padj <0.05)
+
+common <- intersect(intersect(rownames(dds_res_Mon96hvsNeu96h_sig),rownames(dds_res_Mon96hvsMac96h_sig)),rownames(dds_res_Neu96hvsMac96h_sig))
+paste("There are", length(common), "common differenital accessible region amongst the different cell types")
+
+```
+
+*Visualization*
+
+```{r heatmap)}
+library(pheatmap)
+
+# count matrix
+rlog <- rlog(dds)
+
+rownamesTop <- c(rownames(dds_res_Mon96hvsNeu96h_sig), rownames(dds_res_Mon96hvsMac96h_sig), rownames(dds_res_Neu96hvsMac96h_sig))
+rownamesTop <- unique(rownamesTop)
+
+# Extract the count matrix for significant peaks
+count_matrix_top <- assay(rlog)[rownamesTop, ]
+pheatmap(count_matrix_top, 
+         cluster_rows = TRUE,  # Cluster rows
+         cluster_cols = FALSE,  # Cluster columns
+         scale = "row",        # Scale rows (optional)
+         show_rownames = FALSE,  # Hide row names
+         show_colnames = TRUE,   # Show column names
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         main = "Differential accessibility across the cell-types")  # Define color palette
+
+
+
+```
+*Mapping regions to genes!* 
+
+we aim to align the chromosomal regions with genes. This alignment enables us to juxtapose the accessibility of specific regions with their corresponding genes from the RNAseq expression outcomes from the same study of the same cell types (GSE79044).
+
+```{r annotation}
+library(IRanges)
+library(ChIPseeker)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(org.Hs.eg.db)
+txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene
+
+Annotate <- function(data){
+  regions_info <- strsplit(rownames(data), "_")
+  regions_chr <- sapply(regions_info, "[", 1)
+  regions_start <- as.integer(sapply(regions_info, "[", 2))
+  regions_end <- as.integer(sapply(regions_info, "[", 3))
+  # Create GRanges object
+  regions <- GRanges(seqnames = regions_chr,
+                   ranges = IRanges(start = regions_start,
+                                    end = regions_end), strand = "*")
+  # Find overlapping genes (without considering single-strand genes only)
+  overlapping <- findOverlaps(regions, genes(txdb))
+  # Extract gene annotations
+  overlapping_genes <- genes(txdb)[queryHits(overlapping)]
+  gene_annotations <- mcols(overlapping_genes)$gene_id # You can choose other annotations like gene symbols if needed
+  # adding to dataframe
+  data$Entrez <- rep(NA, nrow(data)) # Replace with gene annotations where available
+  data$Entrez[queryHits(overlapping)] <- gene_annotations # Replace with gene annotations where available
+  data <- data[!is.na(data$Entrez), ]
+  data$GeneENSG <- mapIds(org.Hs.eg.db, keys = data$Entrez, column = "ENSEMBL", keytype = "ENTREZID")
+  return(data)
+}
+
+dds_res_Mon96hvsNeu96h_sig <- Annotate(dds_res_Mon96hvsNeu96h_sig)
+dds_res_Mon96hvsMac96h_sig <- Annotate(dds_res_Mon96hvsMac96h_sig)
+dds_res_Neu96hvsMac96h_sig <- Annotate(dds_res_Neu96hvsMac96h_sig)
+
+  
+```
+
+*ATAC-seq vs RNA-seq* 
+
+Let's take the comparison we made for Mon96h vs Mac96h. The top 50 significant accessible peaks are selected to compare with the expression data from RNA-seq (GSE79044). Does the accessibility of these genes, also associate with their expression?
+
+```{r comparison with RNA-seq)}
+library(dplyr)
+library(gplots)
+
+# Import RNAseq data 
+RNAseq_files <- file.path(dir("~/Library/Mobile Documents/com~apple~CloudDocs/BESE394/Week_3", pattern = '*.txt')) # all files with the peaks (reading BED files)
+RNAseq_list <- lapply(RNAseq_files, read.table, header = T, sep = "\t", row.names = 1) # Assuming files have headers
+count <- bind_cols(RNAseq_list)
+rownames(count) <- gsub("\\..*$", "", rownames(count))
+
+# RNA-seq
+RNAcount_filt  <- subset(count, rownames(count) %in% dds_res_Mon96hvsMac96h_sig$GeneENSG)
+sorted_indices <- order(rownames(RNAcount_filt))
+RNAcount_filt <- RNAcount_filt[sorted_indices, ]
+# ATAC-seq
+ATACcount_filt <-  subset(dds_res_Mon96hvsMac96h_sig, dds_res_Mon96hvsMac96h_sig$GeneENSG %in% rownames(count))
+sorted_indices <- order(ATACcount_filt$GeneENSG)
+ATACcount_filt <- ATACcount_filt[sorted_indices, ]
+ATACcount_filt_plot <- assay(rlog)[rownames(ATACcount_filt), ]; rownames(ATACcount_filt_plot) <- ATACcount_filt$GeneENSG
+# checking 
+table(ATACcount_filt$GeneENSG == rownames(RNAcount_filt))
+
+
+heatmap_obj <- heatmap.2(as.matrix(ATACcount_filt_plot[1:50,]),
+                         dendrogram = "none",  # No dendrograms
+                         Rowv = FALSE,         # Don't reorder rows
+                         Colv = FALSE,         # Don't reorder columns
+                         scale = "none",       # Don't scale
+                         trace = "none",       # No trace lines
+                         col = heat.colors(10),# Color palette
+                         main = "ATAC Heatmap", # Main title
+                         key = TRUE,           # Show color legend
+                         keysize = 1.5,        # Size of the color legend
+                         key.title = "Scale",  # Title of the color legend
+                         cex.main = 1.2)       # Font size of the main title
+
+heatmap_obj2 <- heatmap.2(as.matrix(log(RNAcount_filt[1:50,])),
+                         dendrogram = "none",  # No dendrograms
+                         Rowv = FALSE,         # Don't reorder rows
+                         Colv = FALSE,         # Don't reorder columns
+                         scale = "none",       # Don't scale
+                         trace = "none",       # No trace lines
+                         col = heat.colors(10),# Color palette
+                         main = "RNA Heatmap", # Main title
+                         key = TRUE,           # Show color legend
+                         keysize = 1.5,        # Size of the color legend
+                         key.title = "Scale",  # Title of the color legend
+                         cex.main = 1.2)       # Font size of the main title
+
+
+```
